@@ -112,7 +112,7 @@ func (c *Client) ReconnectWithBackoff(ctx context.Context, backoff retry.Backoff
 }
 
 // Client returns the underlying *ssh.Client
-func (c *Client) NewSession() *ssh.Client {
+func (c *Client) Client() *ssh.Client {
 	c.mu.Lock()
 	conn := c.conn
 	c.mu.Unlock()
