@@ -16,10 +16,11 @@ import (
 
 	"go.fuchsia.dev/fuchsia/tools/lib/logger"
 	"go.fuchsia.dev/fuchsia/tools/lib/retry"
-	"go.fuchsia.dev/fuchsia/tools/net/sshutil/constants"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/aucloud/go-sshutil/constants"
 )
 
 const (
