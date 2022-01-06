@@ -73,6 +73,27 @@ func (c *Client) RegisterDisconnectListener(ch chan struct{}) {
 	conn.RegisterDisconnectListener(ch)
 }
 
+// ConnectTo ...
+func (c *Client) ConnectTo(
+	ctx context.Context,
+	resolver Resolver,
+	config *ssh.ClientConfig,
+	connectBackoff retry.Backoff,
+) (*Client, error) {
+	conn, err := newConnFromClient(ctx, c, resolver, config, connectBackoff)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{
+		resolver:       resolver,
+		config:         config,
+		connectBackoff: connectBackoff,
+		conn:           conn,
+		connected:      true,
+	}, nil
+}
+
 // Reconnect will disconnect and then reconnect the client, using the client's
 // `connectBackoff` to determine the retry strategy.
 func (c *Client) Reconnect(ctx context.Context) error {
