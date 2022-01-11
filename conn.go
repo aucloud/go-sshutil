@@ -16,10 +16,11 @@ import (
 
 	"go.fuchsia.dev/fuchsia/tools/lib/logger"
 	"go.fuchsia.dev/fuchsia/tools/lib/retry"
-	"go.fuchsia.dev/fuchsia/tools/net/sshutil/constants"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/aucloud/go-sshutil/constants"
 )
 
 const (
@@ -52,6 +53,32 @@ type Conn struct {
 // send keepalive pings as long as the client is connected.
 func newConn(ctx context.Context, resolver Resolver, config *ssh.ClientConfig, backoff retry.Backoff) (*Conn, error) {
 	conn, err := connect(ctx, resolver, config, backoff)
+	if err != nil {
+		return nil, err
+	}
+
+	// We want to log from the keepalive thread, but we don't want to inherit
+	// any of `ctx`'s cancellations. So we will create a new context and
+	// initialize it with the logger in `ctx`.
+	keepaliveCtx := context.Background()
+	if v := logger.LoggerFromContext(ctx); v != nil {
+		keepaliveCtx = logger.WithLogger(keepaliveCtx, v)
+	}
+
+	go func() {
+		t := time.NewTicker(defaultKeepaliveInterval)
+		defer t.Stop()
+		timeout := func() <-chan time.Time {
+			return time.After(defaultKeepaliveTimeout)
+		}
+		conn.keepalive(keepaliveCtx, t.C, timeout)
+	}()
+	return conn, nil
+}
+
+// newConnFromClient ...
+func newConnFromClient(ctx context.Context, client *Client, resolver Resolver, config *ssh.ClientConfig, backoff retry.Backoff) (*Conn, error) {
+	conn, err := connectFromClient(ctx, client, resolver, config, backoff)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +140,43 @@ func connect(ctx context.Context, resolver Resolver, config *ssh.ClientConfig, b
 	}, nil
 }
 
+// connectFromClient ...
+func connectFromClient(ctx context.Context, c *Client, resolver Resolver, config *ssh.ClientConfig, backoff retry.Backoff) (*Conn, error) {
+	startTime := time.Now()
+
+	var addr net.Addr
+	var client *ssh.Client
+	err := retry.Retry(ctx, backoff, func() error {
+		var err error
+		addr, err = resolver.Resolve(ctx)
+		if err != nil {
+			return err
+		}
+		logger.Debugf(ctx, "trying to connect to %s...", addr)
+		client, err = connectToSSHFromClient(ctx, c, addr, config)
+		if err != nil {
+			return err
+		}
+		logger.Debugf(ctx, "connected to %s", addr)
+		return nil
+	}, nil)
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		duration := time.Now().Sub(startTime).Truncate(time.Second)
+		return nil, ConnectionError{fmt.Errorf("%s after %v: %w", constants.TimedOutConnectingMsg, duration, err)}
+	} else if err != nil {
+		return nil, ConnectionError{fmt.Errorf("cannot connect to address %q: %w", addr, err)}
+	}
+
+	return &Conn{
+		Client:       client,
+		addr:         addr,
+		config:       config,
+		shuttingDown: make(chan struct{}),
+	}, nil
+}
+
 func connectToSSH(ctx context.Context, addr net.Addr, config *ssh.ClientConfig) (*ssh.Client, error) {
 	// Update the context with the ssh connection timeout, if specified.
 	if config.Timeout != 0 {
@@ -140,6 +204,58 @@ func connectToSSH(ctx context.Context, addr net.Addr, config *ssh.ClientConfig) 
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
+		return nil, err
+	}
+
+	// We made a TCP connection, now establish an SSH connection over it.
+	//
+	// We can hang if the server accepts a connection but never replies to the
+	// ssh handshake. To handle this case, we'll establish the connection in a
+	// goroutine, and wait for it to complete or the context to be canceled.
+	type result struct {
+		client *ssh.Client
+		err    error
+	}
+
+	ch := make(chan result, 1)
+
+	go func() {
+		clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr.String(), config)
+		if err != nil {
+			if closeErr := conn.Close(); closeErr != nil {
+				err = fmt.Errorf("error closing connection: %v; original error: %w", closeErr, err)
+			}
+			ch <- result{err: err}
+			return
+		}
+
+		ch <- result{client: ssh.NewClient(clientConn, chans, reqs)}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.client, r.err
+	case <-ctx.Done():
+		err = ctx.Err()
+
+		if closeErr := conn.Close(); closeErr != nil {
+			err = fmt.Errorf("error closing connection: %v; original error: %w", closeErr, err)
+		}
+
+		return nil, err
+	}
+}
+
+func connectToSSHFromClient(ctx context.Context, c *Client, addr net.Addr, config *ssh.ClientConfig) (*ssh.Client, error) {
+	// Update the context with the ssh connection timeout, if specified.
+	if config.Timeout != 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
+	}
+
+	conn, err := c.Client().Dial("tcp", addr.String())
+	if err != nil {
 		return nil, err
 	}
 
